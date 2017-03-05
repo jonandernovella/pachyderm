@@ -19,26 +19,25 @@ import (
 )
 
 var (
-	suite                       = "pachyderm"
-	pachdImage                  = "pachyderm/pachd"
-	etcdImage                   = "gcr.io/google_containers/etcd:2.0.12"
-	rethinkImage                = "rethinkdb:2.3.2"
-	rethinkNonCacheMemFootprint = resource.MustParse("256M") // Amount of memory needed by rethink beyond the cache
-	serviceAccountName          = "pachyderm"
-	etcdName                    = "etcd"
-	pachdName                   = "pachd"
-	rethinkControllerName       = "rethink" // Used by both the RethinkDB Stateful Set and ReplicationController (whichever is enabled)
-	rethinkServiceName          = "rethink"
-	rethinkHeadlessName         = "rethink-headless" // headless service; give Rethink pods consistent DNS addresses
-	rethinkVolumeName           = "rethink-volume"
-	rethinkVolumeClaimName      = "rethink-volume-claim"
-	minioSecretName             = "minio-secret"
-	amazonSecretName            = "amazon-secret"
-	googleSecretName            = "google-secret"
-	microsoftSecretName         = "microsoft-secret"
-	initName                    = "pachd-init"
-	trueVal                     = true
-	jsonEncoderHandle           = &codec.JsonHandle{
+	suite                  = "pachyderm"
+	pachdImage             = "pachyderm/pachd"
+	etcdImage              = "gcr.io/google_containers/etcd:2.0.12"
+	rethinkImage           = "rethinkdb:2.3.2"
+	serviceAccountName     = "pachyderm"
+	etcdName               = "etcd"
+	pachdName              = "pachd"
+	rethinkControllerName  = "rethink" // Used by both the RethinkDB Stateful Set and ReplicationController (whichever is enabled)
+	rethinkServiceName     = "rethink"
+	rethinkHeadlessName    = "rethink-headless" // headless service; give Rethink pods consistent DNS addresses
+	rethinkVolumeName      = "rethink-volume"
+	rethinkVolumeClaimName = "rethink-volume-claim"
+	minioSecretName        = "minio-secret"
+	amazonSecretName       = "amazon-secret"
+	googleSecretName       = "google-secret"
+	microsoftSecretName    = "microsoft-secret"
+	initName               = "pachd-init"
+	trueVal                = true
+	jsonEncoderHandle      = &codec.JsonHandle{
 		BasicHandle: codec.BasicHandle{
 			EncodeOptions: codec.EncodeOptions{Canonical: true},
 		},
@@ -71,15 +70,18 @@ func ServiceAccount() *api.ServiceAccount {
 }
 
 // PachdRc returns a pachd replication controller.
-func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, version string, metrics bool, blockCacheSize string) *api.ReplicationController {
+func PachdRc(opts *AssetOpts, backend backend, hostPath string) *api.ReplicationController {
 	image := pachdImage
-	if version != "" {
-		image += ":" + version
+	mem := resource.MustParse(opts.BlockCacheSize)
+	mem.Add(resource.MustParse(opts.PachdNonCacheMemFootprint))
+	cpu := resource.MustParse(opts.PachdCPUFootprint)
+	if opts.Version != "" {
+		image += ":" + opts.Version
 	}
 	// we turn metrics off if we dont have a static version
 	// this prevents dev clusters from reporting metrics
-	if version == deploy.DevVersionTag {
-		metrics = false
+	if opts.Version == deploy.DevVersionTag {
+		opts.Metrics = false
 	}
 	volumes := []api.Volume{
 		{
@@ -202,7 +204,7 @@ func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, v
 								},
 								{
 									Name:  "NUM_SHARDS",
-									Value: strconv.FormatUint(shards, 10),
+									Value: strconv.FormatUint(opts.PachdShards, 10),
 								},
 								{
 									Name:  "STORAGE_BACKEND",
@@ -219,7 +221,7 @@ func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, v
 								},
 								{
 									Name:  "JOB_SHIM_IMAGE",
-									Value: fmt.Sprintf("pachyderm/job-shim:%s", version),
+									Value: fmt.Sprintf("pachyderm/job-shim:%s", opts.Version),
 								},
 								{
 									Name:  "JOB_IMAGE_PULL_POLICY",
@@ -227,15 +229,15 @@ func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, v
 								},
 								{
 									Name:  "PACHD_VERSION",
-									Value: version,
+									Value: opts.Version,
 								},
 								{
 									Name:  "METRICS",
-									Value: strconv.FormatBool(metrics),
+									Value: strconv.FormatBool(opts.Metrics),
 								},
 								{
 									Name:  "LOG_LEVEL",
-									Value: logLevel,
+									Value: opts.LogLevel,
 								},
 								{
 									Name:  client.PPSLeasePeriodSecsEnv,
@@ -251,7 +253,7 @@ func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, v
 								},
 								{
 									Name:  "BLOCK_CACHE_BYTES",
-									Value: blockCacheSize,
+									Value: opts.BlockCacheSize,
 								},
 							},
 							Ports: []api.ContainerPort{
@@ -271,6 +273,12 @@ func PachdRc(shards uint64, backend backend, hostPath string, logLevel string, v
 							},
 							ReadinessProbe:  readinessProbe,
 							ImagePullPolicy: "IfNotPresent",
+							Resources: api.ResourceRequirements{
+								Requests: api.ResourceList{
+									api.ResourceCPU:    cpu,
+									api.ResourceMemory: mem,
+								},
+							},
 						},
 					},
 					ServiceAccountName: serviceAccountName,
@@ -411,11 +419,12 @@ func EtcdService() *api.Service {
 }
 
 // RethinkRc returns a rethinkdb replication controller.
-func RethinkRc(volume string, rethinkdbCacheSize string) *api.ReplicationController {
+func RethinkRc(opts *AssetOpts, volume string) *api.ReplicationController {
 	replicas := int32(1)
-	rethinkCacheQuantity := resource.MustParse(rethinkdbCacheSize)
-	containerFootprint := rethinkCacheQuantity.Copy()
-	containerFootprint.Add(resource.MustParse("256M"))
+	rethinkCacheQuantity := resource.MustParse(opts.RethinkdbCacheSize)
+	mem := rethinkCacheQuantity.Copy()
+	mem.Add(resource.MustParse(opts.RethinkNonCacheMemFootprint))
+	cpu := resource.MustParse(opts.RethinkCPUFootprint)
 	spec := &api.ReplicationController{
 		TypeMeta: unversioned.TypeMeta{
 			Kind:       "ReplicationController",
@@ -470,7 +479,8 @@ func RethinkRc(volume string, rethinkdbCacheSize string) *api.ReplicationControl
 							ImagePullPolicy: "IfNotPresent",
 							Resources: api.ResourceRequirements{
 								Requests: api.ResourceList{
-									api.ResourceMemory: *containerFootprint,
+									api.ResourceMemory: *mem,
+									api.ResourceCPU:    cpu,
 								},
 							},
 						},
@@ -493,13 +503,14 @@ func RethinkRc(volume string, rethinkdbCacheSize string) *api.ReplicationControl
 }
 
 // RethinkStatefulSet returns a rethinkdb stateful set
-func RethinkStatefulSet(shards int, diskSpace int, cacheSize string) interface{} {
-	rethinkCacheQuantity := resource.MustParse(cacheSize)
-	containerFootprint := rethinkCacheQuantity.Copy()
-	containerFootprint.Add(rethinkNonCacheMemFootprint)
-	// As of Oct 24 2016, the Kubernetes client does not include structs for Stateful Set, so we generate the kubernetes
-	// manifest using raw json.
+func RethinkStatefulSet(opts *AssetOpts, diskSpace int) interface{} {
+	rethinkCacheQuantity := resource.MustParse(opts.RethinkdbCacheSize)
+	mem := rethinkCacheQuantity.Copy()
+	mem.Add(resource.MustParse(opts.RethinkNonCacheMemFootprint))
+	cpu := resource.MustParse(opts.RethinkCPUFootprint)
 
+	// As of Oct 24 2016, the Kubernetes client does not include structs for
+	// Stateful Set, so we generate the kubernetes manifest using raw json.
 	// Stateful Set config:
 	return map[string]interface{}{
 		"apiVersion": "apps/v1beta1",
@@ -512,7 +523,7 @@ func RethinkStatefulSet(shards int, diskSpace int, cacheSize string) interface{}
 		"spec": map[string]interface{}{
 			// Effectively configures a RC
 			"serviceName": rethinkHeadlessName,
-			"replicas":    shards,
+			"replicas":    int(opts.RethinkShards),
 			"selector": map[string]interface{}{
 				"matchLabels": labels(rethinkControllerName),
 			},
@@ -560,7 +571,8 @@ func RethinkStatefulSet(shards int, diskSpace int, cacheSize string) interface{}
 							"imagePullPolicy": "IfNotPresent",
 							"resources": map[string]interface{}{
 								"requests": map[string]interface{}{
-									"memory": containerFootprint.String(),
+									"memory": mem.String(),
+									"cpu":    (&cpu).String(),
 								},
 							},
 						},
@@ -900,8 +912,26 @@ type AssetOpts struct {
 	Metrics            bool
 
 	// Deploy single-node rethink managed by a RC, rather than a multi-node,
-	// highly-available Stateful Set. This will be necessary until GKE supports Stateful Set
+	// highly-available Stateful Set. This will be necessary until GKE supports
+	// Stateful Set
 	DeployRethinkAsStatefulSet bool
+
+	// PachdCPUFootprint is the amount of CPU we request for each pachd node, if
+	// set (it can be set by pachctl deploy to override the default)
+	PachdCPUFootprint string
+
+	// PachdNonCacheMemFootprint is the amount of CPU we request for each pachd
+	// node, if set (it can be set by pachctl deploy to override the default)
+	PachdNonCacheMemFootprint string
+
+	// RethinkCPUFootprint is the amount of CPU we request for each rethink node,
+	// if set (it can be set by pachctl deploy to override the default)
+	RethinkCPUFootprint string
+
+	// RethinkNonCacheMemFootprint is the amount of memory we request for each
+	// rethink node in addition to the memory it needs for caching, if set (it
+	// can be set by pachctl deploy to override the default)
+	RethinkNonCacheMemFootprint string
 }
 
 // WriteAssets writes the assets to w.
@@ -925,10 +955,14 @@ func WriteAssets(w io.Writer, opts *AssetOpts, backend backend,
 	RethinkNodeportService(opts).CodecEncodeSelf(encoder)
 	fmt.Fprintf(w, "\n")
 	if opts.DeployRethinkAsStatefulSet {
-		encoder.Encode(RethinkStatefulSet(int(opts.RethinkShards), volumeSize, opts.RethinkdbCacheSize))
+		encoder.Encode(RethinkStatefulSet(opts, volumeSize))
 		fmt.Fprintf(w, "\n")
 		RethinkHeadlessService().CodecEncodeSelf(encoder)
 	} else {
+		// with localBackend, we use local storage and pass 0 storage volumes.
+		// Otherwise, we use at least one storage volume, and since RethinkDB is
+		// being managed by a ReplicationController (and thus must have 1 shard)
+		// we must get exactly one volume
 		if backend != localBackend && backend != minioBackend && len(volumeNames) != 1 {
 			return fmt.Errorf("RethinkDB can only be managed by a ReplicationController as a single instance, but recieved %d volumes", len(volumeNames))
 		}
@@ -937,7 +971,7 @@ func WriteAssets(w io.Writer, opts *AssetOpts, backend backend,
 		if backend != localBackend && backend != minioBackend {
 			volumeName = volumeNames[0]
 		}
-		RethinkRc(volumeName, opts.RethinkdbCacheSize).CodecEncodeSelf(encoder)
+		RethinkRc(opts, volumeName).CodecEncodeSelf(encoder)
 	}
 	fmt.Fprintf(w, "\n")
 
@@ -946,7 +980,7 @@ func WriteAssets(w io.Writer, opts *AssetOpts, backend backend,
 
 	PachdService().CodecEncodeSelf(encoder)
 	fmt.Fprintf(w, "\n")
-	PachdRc(opts.PachdShards, backend, hostPath, opts.LogLevel, opts.Version, opts.Metrics, opts.BlockCacheSize).CodecEncodeSelf(encoder)
+	PachdRc(opts, backend, hostPath).CodecEncodeSelf(encoder)
 	fmt.Fprintf(w, "\n")
 	return nil
 }
